@@ -1,47 +1,110 @@
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from jose import jwt, JWTError, ExpiredSignatureError
+import os
+from typing import List
+
+import yaml
+from dotenv import dotenv_values
+from fastapi import FastAPI, Query
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
 
-ISSUER = "https://idp.exam.local"
-AUDIENCE = "tds-k7i3ssbz.apps.exam.local"
-ALGORITHM = "RS256"
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-PUBLIC_KEY = """-----BEGIN PUBLIC KEY-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA2okOHspNjgA+2rTLbeuY
-cxiP/hG8C6Sb9iwg3yiLAA4HCnpITcbWCSelbvbYGuc3EbNy4xFyf5Cbj5DHJMID
-EkryOgyd2giIIIBOUBj8S63uGcnRpOBh9NFatfNwheKuzsPuVNldu6A9cNteNpXc
-WyJjG2axVfmq7i6SuKr1JoWYG7xTTAvKPujSl4OtsQfO3h5NepzdfXpr28oNnzfW
-ed+zclR6BcmNNo/WVfJ4xyCLSf0BCOgdTgW6PdaChd1l9VDetJZVEgC5tkyvXsfI
-SI6iyrYbKR0NEBSqq4XkadEjsCs4F1RncsS4LlgniT7GlkL9Mce3b0wGLs9/7ZIX
-dQIDAQAB
------END PUBLIC KEY-----"""
+DEFAULTS = {
+    "port": 8000,
+    "workers": 1,
+    "debug": False,
+    "log_level": "info",
+    "api_key": "default-secret-000",
+}
 
-class TokenRequest(BaseModel):
-    token: str
+ENV_NAME = "development"
 
-@app.post("/verify")
-def verify_token(request: TokenRequest):
-    try:
-        payload = jwt.decode(
-            request.token,
-            PUBLIC_KEY,
-            algorithms=[ALGORITHM],
-            audience=AUDIENCE,
-            issuer=ISSUER,
-        )
 
-        return {
-            "valid": True,
-            "email": payload.get("email"),
-            "sub": payload.get("sub"),
-            "aud": payload.get("aud"),
-        }
+def to_bool(value):
+    return str(value).strip().lower() in {"true", "1", "yes", "on"}
 
-    except (ExpiredSignatureError, JWTError, Exception):
-        return JSONResponse(
-            status_code=401,
-            content={"valid": False}
-        )
+
+def coerce_value(key, value):
+    if key in {"port", "workers"}:
+        return int(value)
+    if key == "debug":
+        return to_bool(value)
+    return str(value)
+
+
+def normalize_key(key):
+    key = key.strip()
+    if key == "NUM_WORKERS":
+        return "workers"
+    if key.startswith("APP_"):
+        key = key[4:]
+    return key.strip().lower()
+
+
+def load_yaml_config():
+    filename = f"config.{ENV_NAME}.yaml"
+    if not os.path.exists(filename):
+        return {}
+    with open(filename, "r", encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+    result = {}
+    for key, value in data.items():
+        nk = normalize_key(str(key))
+        result[nk] = coerce_value(nk, value)
+    return result
+
+
+def load_dotenv_config():
+    data = dotenv_values(".env")
+    result = {}
+    for key, value in data.items():
+        if value is None:
+            continue
+        nk = normalize_key(str(key))
+        result[nk] = coerce_value(nk, value)
+    return result
+
+
+def load_os_env_config():
+    result = {}
+    for key, value in os.environ.items():
+        if key.startswith("APP_"):
+            nk = normalize_key(key)
+            result[nk] = coerce_value(nk, value)
+    return result
+
+
+def parse_cli_overrides(items: List[str]):
+    result = {}
+    for item in items:
+        if "=" not in item:
+            continue
+        key, value = item.split("=", 1)
+        nk = normalize_key(key)
+        result[nk] = coerce_value(nk, value)
+    return result
+
+
+@app.get("/effective-config")
+def effective_config(set: List[str] = Query(default=[])):
+    config = DEFAULTS.copy()
+    config.update(load_yaml_config())
+    config.update(load_dotenv_config())
+    config.update(load_os_env_config())
+    config.update(parse_cli_overrides(set))
+
+    response = {
+        "port": int(config.get("port", 8000)),
+        "workers": int(config.get("workers", 1)),
+        "debug": bool(config.get("debug", False)),
+        "log_level": str(config.get("log_level", "info")),
+        "api_key": "****",
+    }
+    return response
